@@ -112,10 +112,6 @@ def main(config):
     # clear cuda
     torch.cuda.empty_cache()
 
-    run_name = f"{config['model']}-{config['catalog']}-{config['target_product_idx']}-{config['length']}"
-    wandb_logger = wandb.init(entity=ENTITY, project=PROJECT, config=config, name=run_name)
-    wandb_table = wandb.Table(columns=["iter", "attack_prompt", "complete_prompt", "generated_result", "product_rank"])
-    
     seed_everything(config['seed'])
 
     user_msg = get_user_query(config['catalog'])
@@ -124,106 +120,148 @@ def main(config):
 
     model, tokenizer = get_model(MODEL_PATH_DICT[config['model']], config['precision'], device)
 
-    product_list, target_product, target_product_natural, target_str = get_product_list(
-        config['catalog'], config['target_product_idx'], config['dataset']
-    )
-    
-    print("TARGET PRODUCT:", target_product)
-    
-    # Convert affirmative templates to target token lists
-    target_token_lists = []
-    target_strings = []
+    # 【新增】初始化多样性惩罚模块（仅当 w_div > 0 时加载 MiniLM 模型）
+    diversity_penalty = None
+    if config.get('w_div', 0.0) > 0:
+        from experiment.diversity import DiversityPenalty
+        diversity_penalty = DiversityPenalty(device=device)
+        print(f"[Diversity] DiversityPenalty initialized, w_div={config['w_div']}")
 
-    if config.get('single_template', False):
-        templates_to_use = ["[TARGET]"]
-        print(f"\nUsing single template mode: '[TARGET]'")
-    else:
-        templates_to_use = AFFIRMATIVE_TEMPLATES[:config.get('num_templates', len(AFFIRMATIVE_TEMPLATES))]
-        print(f"\nUsing {len(templates_to_use)} out of {len(AFFIRMATIVE_TEMPLATES)} available affirmative templates")
+    # 【修改】支持多产品循环
+    target_product_indices = config['target_product_idx']
+    if isinstance(target_product_indices, int):
+        target_product_indices = [target_product_indices]
 
-    target_product_tokens = process_text(
-        tokenizer=tokenizer, 
-        text=target_product, 
-        batch_size=1,
-        device=device
-    )
+    for target_idx in target_product_indices:
+        print(f"\n{'#'*80}")
+        print(f"# Attacking product index: {target_idx}")
+        print(f"{'#'*80}\n")
 
-    for template in templates_to_use:
-        # Replace [TARGET] with actual target product name
-        target_text = template.replace("[TARGET]", target_product)
-        target_strings.append(target_text)
-        
-        # Convert to tokens
-        target_tokens = process_text(
-            tokenizer=tokenizer, 
-            text=target_text, 
+        # 更新 config 中的 target_product_idx（用于 wandb run_name 和结果保存路径）
+        current_config = config.copy()
+        current_config['target_product_idx'] = target_idx
+
+        run_name = f"{current_config['model']}-{current_config['catalog']}-{target_idx}-{current_config['length']}"
+        wandb_logger = wandb.init(
+            entity=ENTITY, project=PROJECT, config=current_config, name=run_name,
+            reinit=True  # 允许多次 init
+        )
+        wandb_table = wandb.Table(columns=["iter", "attack_prompt", "complete_prompt", "generated_result", "product_rank"])
+
+        product_list, target_product, target_product_natural, target_str = get_product_list(
+            current_config['catalog'], target_idx, current_config['dataset']
+        )
+
+        print("TARGET PRODUCT:", target_product)
+
+        # Convert affirmative templates to target token lists
+        target_token_lists = []
+        target_strings = []
+
+        if current_config.get('single_template', False):
+            templates_to_use = ["[TARGET]"]
+            print(f"\nUsing single template mode: '[TARGET]'")
+        else:
+            templates_to_use = AFFIRMATIVE_TEMPLATES[:current_config.get('num_templates', len(AFFIRMATIVE_TEMPLATES))]
+            print(f"\nUsing {len(templates_to_use)} out of {len(AFFIRMATIVE_TEMPLATES)} available affirmative templates")
+
+        target_product_tokens = process_text(
+            tokenizer=tokenizer,
+            text=target_product,
             batch_size=1,
             device=device
         )
-        target_token_lists.append(target_tokens)
-    
-    print("Target strings to optimize for:")
-    for i, target_text in enumerate(target_strings):
-        print(f"  {i+1}. '{target_text}'")
-    if config.get('single_template', False):
-        print("(Single template mode - simpler and faster optimization)")
-    elif len(target_strings) > 5:
-        print("  (showing all templates for transparency)")
-    
-    # Use the token lists for training
-    target_tokens = target_token_lists  # Pass the list of token tensors
 
-    # Attack using RAF approach
-    table, rank = raf_attack_control(
-        model=model, 
-        tokenizer=tokenizer,
-        system_prompt=SYSTEM_PROMPT[config['model'].split("-")[0]],
-        user_msg=user_msg,
-        max_length=config['length'],  
-        target_token_lists=target_tokens,
-        product_list=product_list,
-        target_product=target_product,
-        target_product_tokens=target_product_tokens,
-        logger=wandb_logger,
-        table=wandb_table,
-        mode=config['mode'],
-        num_iter=config['num_iter'], 
-        test_iter=config['test_iter'],
-        batch_size=config['batch_size'],
-        topk=config['topk'],
-        w_tar_1=config['w_tar_1'],
-        w_tar_2=config['w_tar_2'],
-        w_ctrl_2=config['w_ctrl_2'],
-        ctrl_temp=config.get('ctrl_temp', 1.0),
-        random_order=config['random_order'],
-        random_inference=config['random_inference'],
-        use_entropy_adaptive_weighting=config.get('use_entropy_adaptive_weighting', False),
-        entropy_alpha=config.get('entropy_alpha', 1.0),
-        sampling_method=config.get('sampling_method', 'greedy'),
-        control_loss_method=config.get('control_loss_method', 'last_token_ll'),
-        n_steps=config.get('n_steps', 100)
-    )
-    
-    # Log final rank to wandb for sweep optimization
-    wandb_logger.log({
-        'final_rank': rank,
-        'w_tar_1': config['w_tar_1'],
-        'w_tar_2': config['w_tar_2']
-    })
-    
-    print(f"Final target product rank: {rank}")
-    print(f"Parameters: w_tar_1={config['w_tar_1']}, w_tar_2={config['w_tar_2']}")
-    
-    # Save results
-    if config.get('result_dir'):
-        result_path = f'{config["result_dir"]}/{config["model"]}/{config["dataset"]}/{config["catalog"]}/{config["target_product_idx"]}'
-        os.makedirs(result_path, exist_ok=True)
-        table_path = f'{result_path}/autodan_results.csv'
-        table_df = table.get_dataframe()
-        table_df.to_csv(table_path, index=False)
-        print(f"Results saved to {table_path}")
-    
-    wandb_logger.finish()
+        for template in templates_to_use:
+            target_text = template.replace("[TARGET]", target_product)
+            target_strings.append(target_text)
+            target_tokens = process_text(
+                tokenizer=tokenizer,
+                text=target_text,
+                batch_size=1,
+                device=device
+            )
+            target_token_lists.append(target_tokens)
+
+        print("Target strings to optimize for:")
+        for i, target_text in enumerate(target_strings):
+            print(f"  {i+1}. '{target_text}'")
+        if current_config.get('single_template', False):
+            print("(Single template mode - simpler and faster optimization)")
+        elif len(target_strings) > 5:
+            print("  (showing all templates for transparency)")
+
+        target_tokens = target_token_lists
+
+        # 【修改】调用 raf_attack_control，传入多样性惩罚参数，接收 3 个返回值
+        table, rank, best_sequence = raf_attack_control(
+            model=model,
+            tokenizer=tokenizer,
+            system_prompt=SYSTEM_PROMPT[current_config['model'].split("-")[0]],
+            user_msg=user_msg,
+            max_length=current_config['length'],
+            target_token_lists=target_tokens,
+            product_list=product_list,
+            target_product=target_product,
+            target_product_tokens=target_product_tokens,
+            logger=wandb_logger,
+            table=wandb_table,
+            mode=current_config['mode'],
+            num_iter=current_config['num_iter'],
+            test_iter=current_config['test_iter'],
+            batch_size=current_config['batch_size'],
+            topk=current_config['topk'],
+            w_tar_1=current_config['w_tar_1'],
+            w_tar_2=current_config['w_tar_2'],
+            w_ctrl_2=current_config['w_ctrl_2'],
+            ctrl_temp=current_config.get('ctrl_temp', 1.0),
+            random_order=current_config['random_order'],
+            random_inference=current_config['random_inference'],
+            use_entropy_adaptive_weighting=current_config.get('use_entropy_adaptive_weighting', False),
+            entropy_alpha=current_config.get('entropy_alpha', 1.0),
+            sampling_method=current_config.get('sampling_method', 'greedy'),
+            control_loss_method=current_config.get('control_loss_method', 'last_token_ll'),
+            n_steps=current_config.get('n_steps', 100),
+            diversity_penalty=diversity_penalty,  # 【新增】
+            w_div=current_config.get('w_div', 0.0),  # 【新增】
+        )
+
+        # 【新增】攻击完成后，将最佳 prompt 加入历史（用于后续产品的 L_div 计算）
+        if diversity_penalty is not None and best_sequence is not None:
+            from experiment.diversity import decode_for_diversity
+            # 使用统一解码函数，与 compute_div_loss 中的解码完全一致
+            best_prompt = decode_for_diversity(tokenizer, best_sequence)
+            diversity_penalty.add_to_history(best_prompt)
+            print(f"[Diversity] Added to history. Size: {diversity_penalty.get_history_size()}")
+            print(f"[Diversity] Prompt added: '{best_prompt}'")  # 【新增】打印实际加入的 prompt
+
+        # Log final rank to wandb
+        wandb_logger.log({
+            'final_rank': rank,
+            'w_tar_1': current_config['w_tar_1'],
+            'w_tar_2': current_config['w_tar_2'],
+            'w_div': current_config.get('w_div', 0.0),
+        })
+
+        print(f"Final target product rank: {rank}")
+        print(f"Parameters: w_tar_1={current_config['w_tar_1']}, w_tar_2={current_config['w_tar_2']}, w_div={current_config.get('w_div', 0.0)}")
+
+        # Save results
+        if current_config.get('result_dir'):
+            result_path = f'{current_config["result_dir"]}/{current_config["model"]}/{current_config["dataset"]}/{current_config["catalog"]}/{target_idx}'
+            os.makedirs(result_path, exist_ok=True)
+            table_path = f'{result_path}/autodan_results.csv'
+            table_df = table.get_dataframe()
+            table_df.to_csv(table_path, index=False)
+            print(f"Results saved to {table_path}")
+
+        wandb_logger.finish()
+
+    print(f"\n{'='*80}")
+    print(f"All {len(target_product_indices)} products completed.")
+    if diversity_penalty is not None:
+        print(f"Total history size: {diversity_penalty.get_history_size()}")
+    print(f"{'='*80}")
 
 
 def get_args():
@@ -232,7 +270,8 @@ def get_args():
     parser.add_argument("--catalog", type=str, default='coffee_machines')
     parser.add_argument("--model", type=str, choices=['llama-3.1-8b', 'llama-2-7b', 'vicuna-7b', 'mistral-7b', 'deepseek-7b', 'qwen-4b', 'phi-2.7b'], default='vicuna-7b')
     parser.add_argument("--dataset", type=str, default="ragroll", choices=["amazon", "json", "ragroll"])
-    parser.add_argument("--target_product_idx", type=int, default=8)
+    parser.add_argument("--target_product_idx", type=int, nargs='+', default=[8],
+                        help="支持多个产品索引，用空格分隔，如 --target_product_idx 1 2 3")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--length", type=int, default=10, help="Maximum length of adversarial prompt")
     parser.add_argument("--num_iter", type=int, default=100, help="Number of iterations (tokens to generate)")
@@ -261,6 +300,10 @@ def get_args():
     
     parser.add_argument("--control_loss_method", type=str, choices=['last_token_ll', 'ppl'], default='last_token_ll',
                        help="Method to compute control loss: 'last_token_ll' for last token log-likelihood, 'ppl' for perplexity")
+
+    # 多样性惩罚参数
+    parser.add_argument("--w_div", type=float, default=0.0,
+                        help="多样性惩罚权重 w_div，0 表示不启用（默认），与 w_tar_1/w_tar_2/w_ctrl_2 命名保持一致")
 
     return parser.parse_args()
 

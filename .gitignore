@@ -1,0 +1,14 @@
+# IDE
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+
+# experiment artifacts (not part of the code release)
+wandb/
+result/
+ranking_test_results/
+
+# nohup / redirect outputs
+*.log

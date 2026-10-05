@@ -391,7 +391,7 @@ def main():
     device_name = args.device if args.device else "cuda:0"
     device = torch.device(device_name)
     model, tokenizer = get_model(MODEL_PATH_DICT[args.model], args.precision, device)
-    ppl_model, ppl_tokenizer = get_model(MODEL_PATH_DICT["mistral-7b"], args.precision, device)
+    ppl_model, ppl_tokenizer = model, tokenizer
     
     # Evaluate each target product index
     all_results = []

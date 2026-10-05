@@ -4,6 +4,7 @@ from tqdm import tqdm
 import torch.nn.functional as F
 import wandb
 from experiment.process import process_headtail
+from experiment.diversity import decode_for_diversity
 
 
 def get_embedding_matrix(model):
@@ -133,6 +134,9 @@ def raf_attack_control(model, tokenizer, system_prompt, user_msg,
     w_ctrl_2 = kwargs.get('w_ctrl_2', 1.0)
     ctrl_temp = kwargs.get('ctrl_temp', 1.0)
     sampling_method = kwargs.get('sampling_method', 'multinomial')
+    # 【新增】多样性惩罚参数
+    diversity_penalty = kwargs.get('diversity_penalty', None)
+    w_div = kwargs.get('w_div', 0.0)
     
     # Get target product text for fluency context
     target_product_idx = next(i for i, p in enumerate(product_list) if p['Name'] == target_product)
@@ -261,10 +265,11 @@ def raf_attack_control(model, tokenizer, system_prompt, user_msg,
         
         # Evaluate all candidates using existing fine_select method
         # For ablation
-        loss_target, loss_control = stage_two_search(
+        loss_target, loss_control, loss_div = stage_two_search(
             model, tokenizer, head_tokens, candidate_sequences,
             tail_tokens, selected_target_tokens, last_tok_ll,
-            debug=True, w_tar_2=w_tar_2
+            debug=True, w_tar_2=w_tar_2,
+            diversity_penalty=diversity_penalty, w_div=w_div
         )
         
         # Combine objectives for final selection
@@ -315,7 +320,8 @@ def raf_attack_control(model, tokenizer, system_prompt, user_msg,
             print(f"    Initial Entropy: {entropy:.4f} / {max_entropy:.4f} | "
                 f"Adaptive w_ctrl_2: {w_ctrl_2:.4f}")
         
-        combined_losses = w_ctrl_2 * loss_control + w_tar_2 * loss_target
+        # 【修改】合并损失：新增 w_div * loss_div 多样性惩罚项
+        combined_losses = w_ctrl_2 * loss_control + w_tar_2 * loss_target + w_div * loss_div
 
         # Select optimal token using Multinomial Sampling or greedy selection
         temperature = kwargs.get('ctrl_temp', 1.0)
@@ -336,6 +342,7 @@ def raf_attack_control(model, tokenizer, system_prompt, user_msg,
         selected_sequence = candidate_sequences[selected_idx]
         selected_loss_target = loss_target[selected_idx].item()
         selected_loss_control = loss_control[selected_idx].item()
+        selected_loss_div = loss_div[selected_idx].item()  # 【新增】被选中候选的 L_div 标量值
         selected_combined_loss = combined_losses[selected_idx].item()
         
         # Convergence check for this position
@@ -361,6 +368,7 @@ def raf_attack_control(model, tokenizer, system_prompt, user_msg,
         print(f"  Current sequence: '{selected_text}'")
         print(f"  Target loss: {selected_loss_target:.4f}")
         print(f"  Control loss: {selected_loss_control:.4f}")
+        print(f"  Div loss: {selected_loss_div:.4f}")  # 【新增】
         print(f"  Combined loss: {selected_combined_loss:.4f}")
         print(f"  History set size for position {current_position - (1 if position_converged else 0)}: {len(history_set)}")
         
@@ -371,8 +379,11 @@ def raf_attack_control(model, tokenizer, system_prompt, user_msg,
                 "train/position": current_position - (1 if position_converged else 0),
                 "train/target_loss": selected_loss_target,
                 "train/control_loss": selected_loss_control,
+                "train/div_loss": selected_loss_div,          # 【新增】被选中候选的 L_div
                 "train/combined_loss": selected_combined_loss,
                 "train/history_set_size": len(history_set),
+                "train/avg_L_div": loss_div.mean().item(),    # 【新增】所有候选平均 L_div
+                "train/max_L_div": loss_div.max().item(),     # 【新增】所有候选最大 L_div
             }
             logger.log(log_dict, step=step)
         
@@ -420,7 +431,7 @@ def raf_attack_control(model, tokenizer, system_prompt, user_msg,
     # Check if we have a valid best sequence
     if fixed_control_sequence is None:
         print("No valid sequences found during optimization")
-        return table, float('inf')
+        return table, float('inf'), None
     
     # Evaluate best control sequence
     best_embed_weights = get_embedding_matrix(model)
@@ -456,8 +467,8 @@ def raf_attack_control(model, tokenizer, system_prompt, user_msg,
         logger.log(final_metrics, step=step)
     
     print(f"{'='*80}")
-    
-    return final_table, final_rank
+
+    return final_table, final_rank, fixed_control_sequence
 
 
 def sample_control_tokens(target_grad, last_tok_ll, batch_size, topk, 
@@ -623,12 +634,20 @@ def stage_one_shortlisting(model, tokenizer,
     return target_grad, last_tok_ll
 
 
-def stage_two_search(model, 
-                tokenizer, 
+def stage_two_search(model,
+                tokenizer,
                 head_tokens, candidate_sequences,
-                tail_tokens, target_tokens, last_tok_ll, 
+                tail_tokens, target_tokens, last_tok_ll,
                 control_loss_method='last_token_ll',
-                debug=True, w_tar_2=1.0):
+                debug=True, w_tar_2=1.0,
+                diversity_penalty=None, w_div=0.0):
+    """
+    Stage 2 精细搜索：对所有候选序列计算目标损失、可读性损失和多样性惩罚。
+
+    Args:
+        diversity_penalty: DiversityPenalty 实例，为 None 时不计算 L_div
+        w_div: 多样性惩罚权重，为 0 时不计算 L_div（与原版等价）
+    """
     device = model.device
     batch_size = candidate_sequences.shape[0]
         
@@ -668,24 +687,42 @@ def stage_two_search(model,
             target_end = target_start + target_tokens.shape[1]
             loss_target[i] = F.cross_entropy(logits[0, target_start:target_end, :], target_tokens[0])
 
+    # 【新增】计算 loss_div 多样性惩罚
+    if diversity_penalty is not None and w_div > 0:
+        # 用统一解码函数将每个 candidate_sequence 解码为文本
+        candidate_texts = [
+            decode_for_diversity(tokenizer, candidate_sequences[i])
+            for i in range(len(candidate_sequences))
+        ]
+        loss_div = diversity_penalty.compute_div_loss(candidate_texts)
+        # loss_div shape = [len(candidate_sequences)] = [topk]
+        # 和 loss_target, loss_control shape 严格一致
+    else:
+        # w_div=0 分支保护：动态取候选数量，不引入额外计算
+        # dtype 和 loss_target / loss_control 保持一致（float32）
+        loss_div = torch.zeros(len(candidate_sequences), dtype=torch.float32, device=device)
+
     # TODO: Should not be placed here
     if debug:
-        combined_losses = loss_control + w_tar_2 * loss_target
+        # 【修改】combined_losses 包含多样性惩罚项
+        combined_losses = loss_control + w_tar_2 * loss_target + w_div * loss_div
         best_idx = torch.argmin(combined_losses)
-        
+
         for i in range(min(5, batch_size)):
             sequence_text = tokenizer.decode(candidate_sequences[i], skip_special_tokens=True)
             print(f"  {i+1}. Sequence: '{sequence_text}' | "
                   f"Target Loss: {loss_target[i].item():.4f} | "
                   f"Control Loss: {loss_control[i].item():.4f} | "
+                  f"Div Loss: {loss_div[i].item():.4f} | "
                   f"Combined: {combined_losses[i].item():.4f}")
-        
+
         print(f"Best sequence: '{tokenizer.decode(candidate_sequences[best_idx], skip_special_tokens=True)}'")
         print(f"Best sequence target loss: {loss_target[best_idx].item():.4f}")
         print(f"Best sequence control loss: {loss_control[best_idx].item():.4f}")
+        print(f"Best sequence div loss: {loss_div[best_idx].item():.4f}")
         print(f"Best sequence combined loss: {combined_losses[best_idx].item():.4f}")
 
-    return loss_target, loss_control 
+    return loss_target, loss_control, loss_div
 
 
 def log_eval_result(model, tokenizer, attack_prompt, complete_prompt, iter, product_list, target_product, result_table, logger):
