@@ -8,7 +8,7 @@ Official implementation of paper:
 <img width=100% src="./img/raf.png"/>
 </div>
 
-## Our Improvement: Diversity-Regularized RAF
+## Improvement: Diversity-Regularized RAF
 
 **Motivation.** Vanilla RAF optimizes each target product independently. As a result, adversarial prompts for semantically unrelated products often collapse into near-identical templates (mode collapse), which hurts stealth and realism.
 
